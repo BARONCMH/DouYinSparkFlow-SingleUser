@@ -1,0 +1,19 @@
+services:
+  douyin-spark-flow-single-user:
+    image: ghcr.io/2061360308/douyinsparkflow:latest
+    container_name: douyin-spark-flow-single-user
+    init: true
+    shm_size: 1gb
+    entrypoint: ["python", "/app/single-user/panel.py"]
+    environment:
+      TZ: "Asia/Shanghai"
+      GITHUB_ACTIONS: "true"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:18081:18081"
+    volumes:
+      - ./data/config:/app/config
+      - ./data/logs:/app/logs
+      - ./panel.py:/app/single-user/panel.py:ro
+      - ./backend.py:/app/single-user/backend.py:ro
+      - ./runtime:/app/single-user/runtime:ro

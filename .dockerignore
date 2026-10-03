@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+data
+README.md
+DOCKER-小白教程.md
+start-single-user.ps1
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+outputs
+logs

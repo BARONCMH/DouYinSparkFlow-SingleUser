@@ -103,12 +103,25 @@ def get_userData():
             logger.warning(f"{username} 的任务 {cookies_key} 格式不正确，已跳过")
             continue
 
+        storage_state = None
+        state_str = os.getenv(f"storage_state_{unique_id}".upper(), "")
+        if state_str:
+            try:
+                candidate = json.loads(state_str)
+                if isinstance(candidate, dict) and isinstance(candidate.get("cookies"), list):
+                    storage_state = candidate
+                    if storage_state["cookies"]:
+                        cookies = storage_state["cookies"]
+            except json.JSONDecodeError:
+                logger.warning(f"{username} 的完整浏览器状态格式不正确，将只使用 Cookie")
+
         userData.append(
             {
                 "unique_id": unique_id,
                 "username": username,
                 "fingerprint": fingerprint,
                 "cookies": sanitize_cookies(cookies),
+                "storage_state": storage_state,
                 # 目标列表保持原样（不在这里归一化）。
                 # 归一化统一由 tasks.py 在匹配前做 —— 读取端不做加工，
                 # 配置读出来什么就是什么，避免同一份数据两处变换。

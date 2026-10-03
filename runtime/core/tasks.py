@@ -11,7 +11,7 @@ userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
 
 
-def do_user_task(browser, username, cookies, targets):
+def do_user_task(browser, username, cookies, targets, storage_state=None):
     """一个账号的完整流程：门禁 → 滚动找人 → 发送 → 回执确认。
 
     实现委托给 `core.douyin_im.DouyinIM`：
@@ -20,7 +20,7 @@ def do_user_task(browser, username, cookies, targets):
       任务三（发送）    im.type_and_send —— 真实键盘事件 + HTTP/DOM 回执双确认
     拟人化节奏由 cloakbrowser 的 humanize 负责，这里不再叠加延迟。
     """
-    context = browser.new_context()  # 每个任务使用独立的上下文
+    context = browser.new_context(storage_state=storage_state or None)  # 每个任务使用独立的上下文
     context.set_default_navigation_timeout(
         config["browserActionTimeout"]
     )  # 导航超时（毫秒，config 已换算好）
@@ -30,8 +30,9 @@ def do_user_task(browser, username, cookies, targets):
 
     page = context.new_page()
 
-    # 注入 Cookie
-    context.add_cookies(cookies)
+    # 完整授权状态包含 Cookie 和 localStorage；旧账号仍兼容 Cookie-only。
+    if not storage_state:
+        context.add_cookies(cookies)
 
     im = None
     try:
@@ -152,9 +153,9 @@ def runTasks():
         # 创建任务
         try:
             browser = get_browser(fingerprint)
-            do_user_task(browser, username, cookies, targets)
+            do_user_task(browser, username, cookies, targets, user.get("storage_state"))
             logger.info(f"账号 {username} 任务完成")
         finally:
             # 关闭浏览器实例
             browser.close()
-    
+

@@ -14,8 +14,9 @@ GitHub 仓库：[BARONCMH/DouYinSparkFlow-SingleUser](https://github.com/BARONCM
 ## 保留的功能
 
 - 多个抖音号的新增、编辑和删除
-- 手动授权、手机号授权、验证码提交和可点击实时画面
-- 已保存 Cookie 的登录状态检测
+- 抖音 App 扫码授权、二级短信验证码、验证方式自动选择和可点击实时画面
+- 重启授权、手动 Cookie 导入和登录状态检测
+- 已保存登录状态的检测
 - 单个账号发送、全部账号发送、停止发送
 - 每个抖音号的目标好友、消息模板、间隔和定时发送时间
 - 发送记录和运行日志
@@ -31,9 +32,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 如果 PowerShell 阻止脚本，先执行上面的 `Set-ExecutionPolicy`。浏览器打开 <http://127.0.0.1:18081/>。
 
-## Docker 运行（可选）
+## Docker 运行（推荐给不想安装 Python 的用户）
 
-如果已经安装 Docker Desktop，可在本目录执行：
+请按[单用户版 Docker 小白教程](DOCKER-小白教程.md)操作。Docker 镜像会自动下载 Chromium，配置和日志保存在本机 `data` 文件夹，不需要克隆源码或手动安装 Python。
+
+如果已克隆本仓库，也可在仓库目录执行：
 
 ```powershell
 docker compose -f compose.yml up -d
@@ -47,4 +50,4 @@ docker compose -f compose.yml up -d
 docker compose -f compose.yml down
 ```
 
-本目录没有接入线上域名，也没有线上部署步骤。
+单用户版默认只允许本机访问，不要将端口直接开放到公网。

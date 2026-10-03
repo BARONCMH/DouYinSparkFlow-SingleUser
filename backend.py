@@ -1062,6 +1062,26 @@ SMS_STRONG_WORDS = ("安全验证", "身份验证", "验证身份", "短信验�
 # 二级验证里「要用已登录的设备扫码/扫脸」那一档
 VERIFY_QR_WORDS = ("扫码验证", "使用已登录", "已登录账号", "设备扫码", "以确保为本人操作",
                    "本人操作", "扫脸", "人脸识别", "面部识别", "请使用抖音 App")
+# 二级验证只有明确进入“选择验证方式”页面时才自动选项；直接出现的扫码/人脸二维码会原样展示。
+VERIFY_CHOICE_PROMPT_WORDS = ("请选择验证方式", "选择验证方式", "请选择一种验证方式",
+                              "选择一种验证方式", "原设备扫码还是人脸", "原设备验证还是人脸")
+VERIFY_PHONE_WORDS = ("接收短信验证码", "通过短信验证", "使用短信验证", "短信验证",
+                      "手机短信验证", "手机号验证", "手机号码验证", "手机验证",
+                      "通过手机号验证", "通过手机验证", "使用手机号验证", "使用手机验证")
+VERIFY_PHONE_PICK_TEXTS = VERIFY_PHONE_WORDS
+VERIFY_DEVICE_WORDS = ("用原设备扫码", "使用原设备扫码", "原设备扫码", "原设备验证",
+                       "使用原设备验证", "在原设备上验证", "用已登录设备扫码", "使用已登录设备扫码",
+                       "已登录设备扫码", "用已登录设备验证", "用本机抖音扫码", "已登录设备验证")
+VERIFY_FACE_WORDS = ("人脸验证", "人脸识别", "扫脸验证", "扫脸", "面部验证", "面部识别", "刷脸验证")
+VERIFY_DEVICE_PICK_TEXTS = VERIFY_DEVICE_WORDS
+VERIFY_FACE_PICK_TEXTS = ("人脸验证", "使用人脸验证", "通过人脸验证", "进行人脸验证", "人脸核验",
+                          "人脸识别", "使用人脸识别", "通过人脸识别", "扫脸验证", "扫脸",
+                          "面部验证", "面部识别", "刷脸验证", "刷脸")
+VERIFY_FACE_STAGE_WORDS = ("请进行人脸验证", "请完成人脸验证", "正在进行人脸验证",
+                           "人脸识别", "扫脸验证", "面部识别", "活体检测", "请眨眼", "正对屏幕")
+VERIFY_PHONE_FALLBACK_AFTER = 10.0
+VERIFY_DEVICE_FALLBACK_AFTER = 10.0
+VERIFY_FACE_MANUAL_AFTER = 8.0
 # 二级验证有两种形态，**处理方式完全不同** —— 用户特意强调过「两个是不一样的，
 # 一个需要你点一下，一个直接就行」：
 #   ① 直接进扫脸/扫码页：什么都不用点，下面抓二维码那一步自己就能拿到；
@@ -1287,8 +1307,55 @@ def _clean_cookie_list(data) -> list:
     return result
 
 
+def _clean_storage_state(data) -> dict:
+    """Playwright 浏览器状态：同时保留 Cookie 和站点 localStorage。"""
+    if not isinstance(data, dict):
+        return {"cookies": [], "origins": []}
+    cookies = []
+    for item in data.get("cookies") or []:
+        if not isinstance(item, dict) or not item.get("name") or not item.get("domain"):
+            continue
+        cookie = {k: v for k, v in item.items() if v is not None}
+        cookie.setdefault("path", "/")
+        cookie.setdefault("expires", -1)
+        cookie.setdefault("httpOnly", False)
+        cookie.setdefault("secure", False)
+        if cookie.get("sameSite") not in ("Strict", "Lax", "None"):
+            cookie["sameSite"] = "Lax"
+        cookies.append(cookie)
+    origins = []
+    for item in data.get("origins") or []:
+        if not isinstance(item, dict):
+            continue
+        origin = item.get("origin")
+        if not isinstance(origin, str) or not origin.startswith(("https://", "http://")):
+            continue
+        local_storage = item.get("localStorage")
+        origins.append({
+            "origin": origin,
+            "localStorage": [
+                {"name": entry["name"], "value": entry["value"]}
+                for entry in (local_storage if isinstance(local_storage, list) else [])
+                if isinstance(entry, dict)
+                and isinstance(entry.get("name"), str)
+                and isinstance(entry.get("value"), str)
+            ],
+        })
+    return {"cookies": cookies, "origins": origins}
+
+
+def _storage_state_envelope(state: dict) -> str:
+    cleaned = _clean_storage_state(state)
+    return json.dumps({"version": 2, "storage_state": cleaned},
+                      ensure_ascii=False, separators=(",", ":"))
+
+
 def cookie_key(unique_id: str) -> str:
     return ("COOKIES_" + str(unique_id)).upper()
+
+
+def storage_state_key(unique_id: str) -> str:
+    return ("STORAGE_STATE_" + str(unique_id)).upper()
 
 
 def _legacy_accounts_from_env() -> dict:
@@ -1429,32 +1496,49 @@ def account_settings(task: dict) -> dict:
     return out
 
 
-def load_cookies(unique_id: str) -> list:
-    """读取已保存的 Cookie（加密存的，这里解回来），顺手去掉 Playwright 不支持的字段。"""
+def load_storage_state(unique_id: str) -> dict:
+    """读取完整授权状态，同时兼容旧版只保存 Cookie 列表的账号。"""
     uid = str(unique_id or "").strip()
     if not uid:
-        return []
+        return {"cookies": [], "origins": []}
     item = load_accounts().get(uid) or {}
     blob = str(item.get("cookies") or "")
     if not blob:
-        return []
+        return {"cookies": [], "origins": []}
     try:
-        return _clean_cookie_list(json.loads(decrypt_text(blob)))
+        payload = json.loads(decrypt_text(blob))
+        if isinstance(payload, list):
+            return _clean_storage_state({"cookies": payload, "origins": []})
+        if isinstance(payload, dict) and payload.get("version") == 2:
+            return _clean_storage_state(payload.get("storage_state"))
+        if isinstance(payload, dict) and isinstance(payload.get("cookies"), list):
+            return _clean_storage_state(payload)
+        return {"cookies": [], "origins": []}
     except Exception as error:
         # 以前这里静默返回 []：界面上只看到"未授权"，根本查不出是密钥变了还是 Cookie 坏了
         _warn_decrypt(uid, error)
-        return []
+        return {"cookies": [], "origins": []}
+
+
+def load_cookies(unique_id: str) -> list:
+    """读取凭据里的 Cookie 项，兼容旧版 Cookie-only 账号。"""
+    return load_storage_state(unique_id).get("cookies", [])
+
+
+def save_storage_state(unique_id: str, state: dict, **account_fields) -> bool:
+    """加密保存完整 Playwright 浏览器状态。"""
+    uid = str(unique_id or "").strip()
+    cleaned = _clean_storage_state(state)
+    if not uid or not cleaned["cookies"]:
+        return False
+    save_account(uid, cookies=encrypt_text(_storage_state_envelope(cleaned)), **account_fields)
+    invalidate_shot_cache()
+    return True
 
 
 def save_cookies(unique_id: str, cookies: list) -> None:
-    """Cookie 加密后存进 accounts.json —— 直接 cat 那个文件看不到 sessionid。"""
-    uid = str(unique_id or "").strip()
-    if not uid:
-        return
-    cleaned = _clean_cookie_list(cookies)
-    text = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-    save_account(uid, cookies=encrypt_text(text))
-    invalidate_shot_cache()
+    """把导入的 Cookie 列表封装成 storage_state 并加密保存。"""
+    save_storage_state(unique_id, {"cookies": _clean_cookie_list(cookies), "origins": []})
 
 
 def save_account_list(tasks: list, old_unique_id: str = "", new_unique_id: str = "") -> None:
@@ -3804,6 +3888,8 @@ class BrowserSession:
         # 自动那套（自动点「用原设备扫码」+ 抓二维码摆出来）**并列保留**，两边不冲突。
         self.verify_manual = False
         self._verify_pick_at = 0.0   # 上次自动点「用原设备扫码」的时刻
+        self._verify_pick_method = ""  # phone / device / face / manual
+        self._verify_face_hint_shown = False
         self.qr_gone_at = 0.0        # 二维码消失的时刻
         self.phase = "idle"          # idle/opening/qr/scanned/sms/manual/done
         self.page_hint = ""          # 页面上抓到的提示或报错原文
@@ -3964,6 +4050,8 @@ class BrowserSession:
                 self.verify_hint = ""
                 self.verify_manual = False
                 self._verify_pick_at = 0.0
+                self._verify_pick_method = ""
+                self._verify_face_hint_shown = False
                 self.sms_proof = None
                 self.sms_proof_at = 0.0
                 self.phase = "opening"
@@ -4154,6 +4242,9 @@ class BrowserSession:
                 self.verify_qr = False
                 self.verify_hint = ""
                 self.verify_manual = False
+                self._verify_pick_method = ""
+                self._verify_pick_at = 0.0
+                self._verify_face_hint_shown = False
                 self.sms_proof = None
                 self.sms_proof_at = 0.0
                 self._cdp = None
@@ -4188,36 +4279,32 @@ class BrowserSession:
         if not (self.owner or self.unique_id):
             self._set(
                 state="need_id",
-                message="已检测到登录成功，但还没填「抖音号」。请在上方填写并保存配置，再点「导出 Cookies」",
+                message="已检测到抖音登录，但还没有可绑定的抖音号。请先保存账号配置，再重新开始扫码授权。",
             )
             return False
-        self._store(douyin)
-        return True
+        return self._store(context.storage_state())
 
-    def _store(self, cookies: list) -> None:
-        cleaned = []
-        for cookie in cookies:
-            item = {k: v for k, v in cookie.items() if k != "sameSite" and v is not None}
-            cleaned.append(item)
+    def _store(self, storage_state: dict) -> bool:
+        cleaned_state = _clean_storage_state(storage_state)
+        cleaned = cleaned_state["cookies"]
+        if not self._logged_in(cleaned):
+            self._set(message="没有取得完整的抖音浏览器状态，请重新扫码授权")
+            return False
         # 存到哪个账号以 owner 为准：unique_id 会被「保存配置」顺手改，owner 不会
         uid = str(self.owner or self.unique_id or "").strip()
         if not uid:
             self._set(message="还没给这台浏览器指定抖音号，先在上面的配置里填好再试")
-            return
+            return False
         key = cookie_key(uid)
 
         existing = load_accounts().get(uid)
-        if isinstance(existing, dict):
-            save_cookies(uid, cleaned)
-        else:
-            save_account(
-                uid,
-                username=self.username or uid,
-                targets=[],
-                cookies=encrypt_text(
-                    json.dumps(_clean_cookie_list(cleaned), ensure_ascii=False, separators=(",", ":"))
-                ),
-            )
+        account_fields = {} if isinstance(existing, dict) else {
+            "username": self.username or uid,
+            "targets": [],
+        }
+        if not save_storage_state(uid, cleaned_state, **account_fields):
+            self._set(message="浏览器状态没保存成功，请重新扫码授权")
+            return False
         try:
             RELOGIN_PATH.unlink()
         except Exception:
@@ -4233,8 +4320,9 @@ class BrowserSession:
             state="authorized",
             saved=key,
             phase="done",
-            message="登录成功，已保存 %d 个 Cookie 项到 %s" % (len(cleaned), key),
+            message="登录成功，已加密保存完整浏览器状态（%d 个 Cookie 项）" % len(cleaned),
         )
+        return True
 
     # ------------------------------------------------------------------
     # 扫码登录流程
@@ -4559,6 +4647,27 @@ class BrowserSession:
                 return got
         return None
 
+    def _click_verify_method(self, page, methods):
+        text_by_method = {
+            "phone": VERIFY_PHONE_PICK_TEXTS,
+            "device": VERIFY_DEVICE_PICK_TEXTS,
+            "face": VERIFY_FACE_PICK_TEXTS,
+        }
+        for method in methods:
+            picked = self._click_text_any(page, text_by_method[method])
+            if picked:
+                return method, picked
+        return "", None
+
+    def _is_verify_choice_page(self, page) -> bool:
+        """仅把明确的验证方式选择页当作选择页，避免误点直接展示的二维码。"""
+        prompt = self._has_words_any(page, VERIFY_CHOICE_PROMPT_WORDS)
+        phone = self._has_words_any(page, VERIFY_PHONE_WORDS)
+        device = self._has_words_any(page, VERIFY_DEVICE_WORDS)
+        face = self._has_words_any(page, VERIFY_FACE_WORDS)
+        options = sum(bool(value) for value in (phone, device, face))
+        return bool((prompt and options) or options >= 2)
+
     def _submit_phone(self, page, phone: str) -> None:
         """手机号登录第一步：切到「验证码登录」-> 填手机号 -> 点「获取验证码」。"""
         digits = re.sub(r"\D", "", phone or "")
@@ -4712,9 +4821,8 @@ class BrowserSession:
         now = time.time()
 
         # ---- 00) 进二级验证 → 切到「手动模式」，把可操作画面交给用户 ----
-        # 用户要的是：二级验证一来就把实时画面摆出来让人自己操作（那块画面可以点），
-        # 输入用那个通用输入框。**同时自动那套并列保留** —— 下面 1c) 还会替他点
-        # 「用原设备扫码」，抓二维码那步也照旧把码摆出来，两边都能走。
+        # 二级验证一来就把实时画面交给用户；如果页面明确列出验证方式，
+        # 按短信、原设备、人脸顺序尝试。直接出现的二维码不会被自动切换。
         # 判据三条，命中一条就算进了二级验证：
         #   ① 已经抓到二级验证的二维码   ② 已经提交过验证码（抖音正在要下一关）
         #   ③ 页面上出现二级验证的强特征词
@@ -4722,13 +4830,15 @@ class BrowserSession:
         if not self.verify_manual:
             if (self.verify_qr
                     or self._sms_submitted_at
+                    or (self.qr_seen_at and not self._sms_box(page)
+                        and self._is_verify_choice_page(page))
                     or self._has_words_any(page, VERIFY_STAGE_WORDS)):
                 with self.lock:
                     self.verify_manual = True
                 self._set(
-                    message="抖音要求二级验证 —— 下面那块画面可以直接点，"
-                            "也可以打字用下面那个通用输入框；"
-                            "我同时会帮你点「用原设备扫码」、把二维码摆出来。"
+                    message="抖音要求二级验证 —— 下面那块画面可以直接点；"
+                            "若出现验证方式选择，会依次尝试短信、原设备扫码、人脸。"
+                            "直接出现的二维码会原样展示。身份核验请按抖音 App 提示完成。"
                 )
 
         # ---- 0a) 验证码已经敲进抖音的框里了：等几秒，再替用户点「验证」 ----
@@ -4740,53 +4850,6 @@ class BrowserSession:
             )
             return False
 
-        # ---- 0) 抖音弹了「身份验证」让你选怎么验证：自动帮用户选「接收短信验证码」----
-        # 排在扫码前面：能看到「接收短信验证码」就说明码已经被扫了，
-        # 后面那些“还在等扫二维码”的判断都不适用了。
-        if self.qr_seen_at and self._has_words(page, SMS_CHOICE_TEXTS):
-            if now - self._sms_choice_at > SMS_CHOICE_EVERY:
-                self._sms_choice_at = now
-                try:
-                    picked = page.evaluate(_JS_CLICK_BY_TEXT, list(SMS_CHOICE_TEXTS))
-                except Exception:
-                    picked = None
-                if isinstance(picked, dict) and picked.get("ok"):
-                    with self.lock:
-                        self.phase = "sms"
-                    self._set(
-                        message="抖音要求身份验证，已经帮你点了「接收短信验证码」，等手机收到短信就把验证码填在下面。",
-                        sms_hint="抖音弹了「身份验证」，已经自动选了「接收短信验证码」。"
-                                 "把手机收到的验证码填在下面，我替你填进抖音并点「验证」。",
-                    )
-                else:
-                    self._set(
-                        message="抖音要求身份验证，但没能自动点动「接收短信验证码」——"
-                                "请点下面截图里那一行（或用上面的「实时画面」点一下）。",
-                        page_hint="需要你点一下「接收短信验证码」",
-                    )
-                return False
-
-        # ---- 0b) 选了短信验证后，万一抖音还要再点一下「获取验证码」才发短信 ----
-        if (
-            self.qr_seen_at
-            and self._sms_choice_at
-            and now - self._sms_choice_at > 8.0
-            and now - self._sms_send_at > SMS_SEND_EVERY
-            and not self._sms_box(page)
-            and self._has_words(page, SMS_SEND_TEXTS)
-        ):
-            self._sms_send_at = now
-            try:
-                sent = page.evaluate(_JS_CLICK_BY_TEXT, list(SMS_SEND_TEXTS))
-            except Exception:
-                sent = None
-            if isinstance(sent, dict) and sent.get("ok"):
-                self._set(
-                    message="现在帮你点了「%s」，短信马上到。"
-                            % str(sent.get("text") or SMS_SEND_TEXTS[0]),
-                    sms_hint="已经帮你发了一条短信验证码，收到后填在下面。",
-                )
-
         # ---- 1) 弹窗还没出来就自己点开「登录」----
         if not self.qr_seen_at and now - self.started_at > 2.0:
             if not self._has_words(page, MODAL_WORDS) and now - self._last_login_click > 5.0:
@@ -4796,36 +4859,119 @@ class BrowserSession:
                 except Exception:
                     hit = None
                 if isinstance(hit, dict) and hit.get("ok"):
-                    self._set(message="已自动点开抖音登录弹窗：填手机号，或切到「手动授权」页签自己操作")
+                    self._set(message="已自动打开抖音登录页：请用抖音 App 扫描下方二维码")
 
         qr = self._find_qr(page)
 
-        # ---- 1c) 二级验证「先让你选怎么验证」那一页：自动点「用原设备扫码」----
-        # 只处理「选择页」那种（形态②）：页面上有人脸识别/原设备验证那些字，而且**还没出二维码**。
-        # 形态①（直接扫脸/扫码）一个字都不用点，下面抓二维码那步自己就拿到了 ——
-        # 这两种必须分开，混在一起会在扫脸页上乱点，反而把人带进死路。
-        if (
-            not qr
-            and self.verify_manual
-            and now - self._verify_pick_at > VERIFY_PICK_EVERY
-            and self._has_words_any(page, VERIFY_CHOICE_WORDS)
-        ):
-            self._verify_pick_at = now
-            picked = self._click_text_any(page, VERIFY_PICK_TEXTS)
-            if picked:
+        # 仅在已经扫过登录二维码、而且页面明确列出多个二级验证选项时点选。
+        # 抖音若直接给出原设备/人脸二维码，留给用户扫码，不在该页面上乱点。
+        sms_box = self._sms_box(page)
+        choice_page = bool(not sms_box and self._is_verify_choice_page(page))
+        if not choice_page and self._verify_pick_method:
+            self._verify_pick_method = ""
+            self._verify_pick_at = 0.0
+        if not qr and self.qr_seen_at and self.verify_manual and choice_page:
+            method = self._verify_pick_method
+            if not method:
+                method, picked = self._click_verify_method(page, ("phone", "device", "face"))
+                label = str((picked or {}).get("text") or "")
+                self._verify_pick_method = method or "manual"
+                self._verify_pick_at = now
+                if method == "phone":
+                    self._sms_choice_at = now
+                    self._sms_send_at = 0.0
+                    self._set(
+                        phase="sms",
+                        message="已优先选择短信验证。收到验证码后填在下方；若无法继续，会再尝试原设备扫码。",
+                        sms_hint="已选择「%s」，请留意手机短信。" % (label or "手机号/短信验证"),
+                    )
+                elif method == "device":
+                    self._sms_choice_at = 0.0
+                    self._sms_send_at = 0.0
+                    self._set(
+                        phase="scanned",
+                        sms_hint="",
+                        message="当前没有可用的短信验证入口，已选择原设备扫码；若无法继续，会再尝试人脸。",
+                        page_hint="请用已登录的抖音 App 扫描页面二维码。",
+                    )
+                elif method == "face":
+                    self._sms_choice_at = 0.0
+                    self._sms_send_at = 0.0
+                    self._set(
+                        phase="scanned",
+                        sms_hint="",
+                        message="短信和原设备入口不可用，已打开人脸验证。请在抖音 App 中按提示完成核验。",
+                        page_hint="人脸验证需要你在抖音 App 中亲自完成。",
+                    )
+                else:
+                    self._set(
+                        phase="scanned",
+                        sms_hint="",
+                        message="无法识别验证选项，请在下方可点击画面中依次选择短信、原设备扫码或人脸。",
+                        page_hint="验证画面可点击；身份核验请在抖音 App 中完成。",
+                    )
+                return False
+
+            if method == "phone" and now - self._verify_pick_at >= VERIFY_PHONE_FALLBACK_AFTER:
+                next_method, picked = self._click_verify_method(page, ("device", "face"))
+                self._sms_choice_at = 0.0
+                self._sms_send_at = 0.0
+                self._verify_pick_method = next_method or "manual"
+                self._verify_pick_at = now
+                if next_method == "device":
+                    self._set(phase="scanned", sms_hint="",
+                              message="短信验证没有继续，已回退到原设备扫码；若仍无法继续，会再尝试人脸。",
+                              page_hint="请用已登录的抖音 App 扫描页面二维码。")
+                elif next_method == "face":
+                    self._set(phase="scanned", sms_hint="",
+                              message="短信验证无法继续，已回退到人脸验证。请在抖音 App 中按提示完成核验。",
+                              page_hint="人脸验证需要你在抖音 App 中亲自完成。")
+                else:
+                    self._set(phase="scanned", sms_hint="",
+                              message="短信验证无法继续，也未识别到原设备或人脸入口。请在下方画面中手动选择。",
+                              page_hint="验证画面可点击；请按抖音 App 提示操作。")
+                return False
+
+            if method == "device" and now - self._verify_pick_at >= VERIFY_DEVICE_FALLBACK_AFTER:
+                picked = self._click_text_any(page, VERIFY_FACE_PICK_TEXTS)
+                self._verify_pick_method = "face" if picked else "manual"
+                self._verify_pick_at = now
                 self._set(
-                    message="抖音让你选验证方式，已经帮你点了「%s」 —— "
-                            "二维码出来我就摆出来，你也可以直接在下面那块画面里操作。"
-                            % str(picked.get("text") or VERIFY_PICK_TEXTS[0]),
-                    page_hint="已自动选择：%s" % str(picked.get("text") or ""),
+                    phase="scanned",
+                    sms_hint="",
+                    message=("原设备扫码没有继续，已回退到人脸验证。请在抖音 App 中按提示核验。"
+                             if picked else "原设备扫码没有继续，且未识别到人脸入口。请在下方可点击画面中选择人脸验证。"),
+                    page_hint="人脸验证需要你在抖音 App 中亲自完成。",
                 )
-            else:
-                self._set(
-                    message="抖音让你选验证方式，但没能自动点上「用原设备扫码」 —— "
-                            "请在下面那块画面里自己点一下（那块画面是可以点的）。",
-                    page_hint="请手动点「用原设备扫码」",
-                )
+                return False
+
+            if method == "face" and now - self._verify_pick_at >= VERIFY_FACE_MANUAL_AFTER:
+                self._verify_pick_method = "manual"
+                self._set(message="人脸验证入口已打开；如果页面仍停在方式选择，请在下方画面中操作。",
+                          page_hint="验证画面可点击；人脸核验请在抖音 App 中完成。")
+                return False
             return False
+
+        if (not qr and self.qr_seen_at and self._sms_choice_at
+                and now - self._sms_choice_at > 8.0
+                and now - self._sms_send_at > SMS_SEND_EVERY
+                and not self._sms_box(page)
+                and self._has_words_any(page, SMS_SEND_TEXTS)):
+            self._sms_send_at = now
+            sent = self._click_text_any(page, SMS_SEND_TEXTS)
+            if sent:
+                self._set(message="已点「%s」，短信验证码应该很快会到。"
+                                  % str(sent.get("text") or SMS_SEND_TEXTS[0]),
+                          sms_hint="短信验证码已请求发送，请收到后填在下方。")
+
+        face_stage = bool(not qr and self.verify_manual
+                          and self._has_words_any(page, VERIFY_FACE_STAGE_WORDS))
+        if face_stage and not self._verify_face_hint_shown:
+            self._verify_face_hint_shown = True
+            self._set(message="抖音正在进行人脸验证，请在手机抖音 App 中按页面提示完成。",
+                      page_hint="人脸核验由你在抖音 App 中完成。")
+        elif not face_stage:
+            self._verify_face_hint_shown = False
 
         if not qr and self.verify_qr:
             # 二维码没了（扫过了 / 验证过了）就把二级验证的提示收掉
@@ -4840,6 +4986,7 @@ class BrowserSession:
                 digest = hashlib.sha256(raw).hexdigest()[:16]
                 # 页面上写着「用已登录的设备扫码」这类字 = 这是二级验证的码，不是登录码
                 verify_words = self._has_words_any(page, VERIFY_QR_WORDS)
+                is_verify_qr = bool(verify_words or self.verify_manual)
                 with self.lock:
                     fresh = digest != self.qr_hash
                     self.qr_png = raw
@@ -4849,11 +4996,11 @@ class BrowserSession:
                     if not self.qr_seen_at:
                         self.qr_seen_at = now
                         self.phase = "qr"
-                        self.message = "请在下面填手机号并点「手机号登录」；要自己操作画面就切到「手动授权」页签"
+                        self.message = "请用抖音 App 扫描下方二维码并确认登录"
                     elif self.phase in ("idle", "opening", "manual"):
                         self.phase = "qr"
                     self.qr_gone_at = 0.0
-                    if verify_words:
+                    if is_verify_qr:
                         self.verify_qr = True
                         self.verify_hint = ("抖音要求二级验证：用你手机上已登录的抖音 App " +
                                             "扫下面这个二维码" +
@@ -5617,9 +5764,10 @@ class LoginChecker:
         stop_watchdog = threading.Event()
         deadline = time.time() + CHECK_TIMEOUT
         try:
-            cookies = load_cookies(unique_id)
+            storage_state = load_storage_state(unique_id)
+            cookies = storage_state.get("cookies", [])
             if not cookies:
-                self._finish(unique_id, False, "还没有保存 Cookie，请先授权登录", {"reason": "no_cookie"})
+                self._finish(unique_id, False, "还没有保存登录状态，请先扫码授权", {"reason": "no_cookie"})
                 return
             has_session = any(
                 c.get("name") in ("sessionid", "sessionid_ss") and c.get("value") for c in cookies
@@ -5635,8 +5783,12 @@ class LoginChecker:
                     "--disable-blink-features=AutomationControlled",
                 ],
             )
-            context = instance.new_context(viewport=VIEWPORT, locale="zh-CN", user_agent=USER_AGENT)
-            context.add_cookies(cookies)
+            context = instance.new_context(
+                viewport=VIEWPORT,
+                locale="zh-CN",
+                user_agent=USER_AGENT,
+                storage_state=storage_state,
+            )
             page = context.new_page()
             cdp = context.new_cdp_session(page)
 
@@ -5713,7 +5865,7 @@ class LoginChecker:
 
             if not conversations:
                 reason = "页面被登录弹窗挡住了" if info.get("loginDialog") else "页面里没有出现好友列表"
-                hint = "，Cookie 可能已过期，请重新授权登录" if has_session else "，请点「开始授权」用手机号登录"
+                hint = "，登录状态可能已过期，请重新扫码授权" if has_session else "，请点「开始扫码授权」"
                 self._finish(
                     unique_id,
                     False,
@@ -6174,6 +6326,7 @@ def accounts_env() -> dict:
     """
     tasks = []
     cookies = {}
+    storage_states = {}
     for uid, item in load_accounts().items():
         settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
         tasks.append(
@@ -6193,11 +6346,18 @@ def accounts_env() -> dict:
         if not blob:
             continue
         try:
-            cookies[cookie_key(uid)] = decrypt_text(blob)
+            storage_state = load_storage_state(uid)
+            cookies[cookie_key(uid)] = json.dumps(
+                storage_state["cookies"], ensure_ascii=False, separators=(",", ":")
+            )
+            storage_states[storage_state_key(uid)] = json.dumps(
+                storage_state, ensure_ascii=False, separators=(",", ":")
+            )
         except Exception:
             continue
     env = {"TASKS": json.dumps(tasks, ensure_ascii=False, separators=(",", ":"))}
     env.update(cookies)
+    env.update(storage_states)
     return env
 
 

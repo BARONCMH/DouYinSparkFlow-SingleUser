@@ -1274,14 +1274,14 @@ def scroll_and_select_user(page, username, targets, skip=None):
         close_search_panel(page)
 
 
-def do_user_task(browser, username, cookies, targets, unique_id=""):
+def do_user_task(browser, username, cookies, targets, unique_id="", storage_state=None):
     account = username
     # 切到这个号自己的消息模板 / 一言类型 / 发送间隔（没单独配就用全局的）
     apply_account_settings(unique_id)
     # 好友映射是全局 dict：不清理的话，上一个账号抓到的好友会留到下一个账号，
     # 万一重名就可能匹配到别的账号的会话（现在靠 checkTargetName 兜着，但别留这个隐患）
     userIDDict.clear()
-    context = browser.new_context()  # 每个任务使用独立的上下文
+    context = browser.new_context(storage_state=storage_state or None)  # 每个任务使用独立的上下文
     context.set_default_navigation_timeout(
         config["browserTimeout"]
     )  # 设置导航超时时间为 120 秒
@@ -1293,8 +1293,9 @@ def do_user_task(browser, username, cookies, targets, unique_id=""):
 
     page.on("response", handle_response)  # 监听响应，收集好友完整信息用于匹配
 
-    # 注入 Cookie
-    context.add_cookies(cookies)
+    # 完整授权状态包含 Cookie 和 localStorage；旧账号仍兼容 Cookie-only。
+    if not storage_state:
+        context.add_cookies(cookies)
 
     # [本地增强] 记录本次发送结果，结束后写进 send-status.json 供控制台展示
     entry = {
@@ -1591,7 +1592,14 @@ def runTasks():
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
             # 创建任务
-            do_user_task(browser, username, cookies, targets, user.get("unique_id", ""))
+            do_user_task(
+                browser,
+                username,
+                cookies,
+                targets,
+                user.get("unique_id", ""),
+                user.get("storage_state"),
+            )
             logger.info(f"账号 {username} 任务完成")
     finally:
         # 关闭浏览器实例
